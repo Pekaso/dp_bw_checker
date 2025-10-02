@@ -243,6 +243,9 @@ function calculateCvtTiming({
   };
 }
 
+const TIMING_COLORS = ['#2563eb', '#22c55e', '#f97316', '#a855f7'];
+const MST_SLOT_TOTAL = 64;
+
 function codingEfficiency(coding: Coding) { return coding === "8b10b" ? 0.8 : 128/132; }
 function clamp(n:number, lo:number, hi:number){ return Math.max(lo, Math.min(hi,n)); }
 
@@ -320,13 +323,82 @@ export default function App(){
   const rawCapacityGbps = rate * lanes;
   const payloadCapacityGbps = rawCapacityGbps * eff;
 
-  const parsed = timings.map(t=>({ ...t, peak: Number(t.peakBw)||0, peakDsc: Number(t.peakBwDsc)||0 }));
-  const totalGbps = parsed.reduce((s,t)=> s + (t.useDsc ? t.peakDsc : t.peak), 0);
+  const parsed = timings.map((t) => {
+    const peak = Number(t.peakBw) || 0;
+    const peakDsc = Number(t.peakBwDsc) || 0;
+    const selected = t.useDsc ? peakDsc : peak;
+    const pixelClock = typeof t.pixelClock === 'number' && Number.isFinite(t.pixelClock) ? t.pixelClock : undefined;
+    return { ...t, peak, peakDsc, selected, pixelClock };
+  });
+  const totalGbps = parsed.reduce((sum, row) => sum + row.selected, 0);
   const fits = totalGbps <= payloadCapacityGbps + 1e-9;
   const margin = payloadCapacityGbps - totalGbps;
   const marginPct = payloadCapacityGbps>0 ? (margin/payloadCapacityGbps)*100 : 0;
   const utilPct = clamp((totalGbps/Math.max(payloadCapacityGbps,1e-6))*100, 0, 100);
   const barColor = utilColor(fits, marginPct);
+
+  const mstAllocation = useMemo(() => {
+    const slotCount = MST_SLOT_TOTAL;
+    if (!Number.isFinite(payloadCapacityGbps) || payloadCapacityGbps <= 0 || parsed.length === 0) {
+      return {
+        slots: Array(slotCount).fill(null) as Array<number | null>,
+        slotCounts: Array(parsed.length).fill(0),
+        overflowSlots: 0,
+        totalExact: 0,
+      };
+    }
+
+    const selectedBandwidths = parsed.map((row) => Math.max(0, row.selected));
+    const exactSlots = selectedBandwidths.map((value) => (value / payloadCapacityGbps) * slotCount);
+    let slotCounts = exactSlots.map((value) => Math.max(0, Math.floor(value)));
+    let remaining = slotCount - slotCounts.reduce((sum, current) => sum + current, 0);
+    const remainders = exactSlots.map((value, index) => ({ index, fraction: value - Math.floor(value) }));
+
+    if (remaining > 0) {
+      const sorted = [...remainders].sort((a, b) => b.fraction - a.fraction);
+      for (const item of sorted) {
+        if (remaining <= 0) break;
+        slotCounts[item.index] += 1;
+        remaining -= 1;
+      }
+    } else if (remaining < 0) {
+      const sorted = [...remainders].sort((a, b) => a.fraction - b.fraction);
+      for (const item of sorted) {
+        if (remaining >= 0) break;
+        if (slotCounts[item.index] > 0) {
+          slotCounts[item.index] -= 1;
+          remaining += 1;
+        }
+      }
+      if (remaining < 0) {
+        for (let index = 0; index < slotCounts.length && remaining < 0; index += 1) {
+          while (slotCounts[index] > 0 && remaining < 0) {
+            slotCounts[index] -= 1;
+            remaining += 1;
+          }
+        }
+      }
+    }
+
+    const slots: Array<number | null> = Array(slotCount).fill(null);
+    let cursor = 0;
+    slotCounts.forEach((count, timingIndex) => {
+      for (let i = 0; i < count && cursor < slotCount; i += 1) {
+        slots[cursor] = timingIndex;
+        cursor += 1;
+      }
+    });
+
+    const totalExact = exactSlots.reduce((sum, value) => sum + value, 0);
+    const overflowSlots = totalExact > slotCount ? Math.round(totalExact - slotCount) : 0;
+
+    return { slots, slotCounts, overflowSlots, totalExact };
+  }, [parsed, payloadCapacityGbps]);
+
+  const mstSlots = mstAllocation.slots;
+  const slotCounts = mstAllocation.slotCounts;
+  const slotsUsed = slotCounts.reduce((sum, current) => sum + current, 0);
+  const overflowSlots = mstAllocation.overflowSlots;
 
   const chartRows = parsed.map((t, index) => ({
     name: t.label || Timing ,
@@ -802,6 +874,30 @@ export default function App(){
               <div className="mt-2 flex justify-between text-[11px] text-slate-500">
                 <span>{utilPct.toFixed(1)}% used</span>
                 <span>{margin.toFixed(2)} Gbps slack</span>
+              </div>
+              <div className="mt-4">
+                <div className="flex items-center justify-between text-[11px] font-medium text-slate-500">
+                  <span>MST time slots</span>
+                  <span>{slotsUsed}/{MST_SLOT_TOTAL}{overflowSlots > 0 ? ` (+${overflowSlots} overflow)` : ''}</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <div className="flex min-w-[512px] gap-1 py-1">
+                    {mstSlots.map((slotOwner, index) => {
+                      const color = slotOwner !== null ? TIMING_COLORS[slotOwner % TIMING_COLORS.length] : '#cbd5f5';
+                      const tooltip = slotOwner !== null
+                        ? `${parsed[slotOwner]?.label ?? 'Timing'} • ${slotCounts[slotOwner]} slots • ${(parsed[slotOwner]?.selected ?? 0).toFixed(2)} Gbps`
+                        : 'Unallocated slot';
+                      return (
+                        <div
+                          key={index}
+                          className="h-3 w-3 rounded-sm border border-slate-200"
+                          style={{ backgroundColor: color, opacity: slotOwner !== null ? 1 : 0.35 }}
+                          title={tooltip}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
               <div className="mt-3 leading-relaxed text-[11px] text-slate-500">
                 <p className="mb-1">Assumes only line coding overhead. Protocol framing is ignored.</p>
