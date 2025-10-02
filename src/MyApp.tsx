@@ -56,6 +56,193 @@ const PREDEFINED_MODES: PredefinedMode[] = [
   { label: "5120×1440 @ 120", h: 5120, v: 1440, hz: 120 },
 ];
 
+const COLOR_FORMATS = {
+  rgb: { label: "RGB", factor: 3 },
+  yuv444: { label: "YUV 4:4:4", factor: 3 },
+  yuv422: { label: "YUV 4:2:2", factor: 2 },
+  yuv420: { label: "YUV 4:2:0", factor: 1.5 },
+} as const;
+
+type ColorFormatId = keyof typeof COLOR_FORMATS;
+
+const DEFAULT_BPC = 8;
+const DEFAULT_COLOR_FORMAT: ColorFormatId = "rgb";
+const LANE_OPTIONS = [1, 2, 4] as const;
+
+
+
+
+const CVT_CELL_GRAN = 8;
+const CVT_HSYNC_PERCENT = 0.08;
+const CVT_MIN_V_PORCH = 3;
+const CVT_MIN_VSYNC_BP = 550;
+const CVT_MIN_V_BPORCH = 6;
+const CVT_MARGIN_PERCENT = 1.8;
+const CVT_C_PRIME = 30;
+const CVT_M_PRIME = 300;
+
+type CvtProfile = Exclude<CvtKind, "manual">;
+
+interface CvtTimingResult {
+  pixelClockMHz: number;
+  hTotal: number;
+  vTotal: number;
+  hBlank: number;
+  vBlank: number;
+  hFront: number;
+  hSync: number;
+  hBack: number;
+  vFront: number;
+  vSync: number;
+  vBack: number;
+}
+
+function calculateCvtTiming({
+  hActive,
+  vActive,
+  refreshHz,
+  reducedBlanking,
+  margins = false,
+  interlaced = false,
+  videoOptimized = false,
+}: {
+  hActive: number;
+  vActive: number;
+  refreshHz: number;
+  reducedBlanking: CvtProfile;
+  margins?: boolean;
+  interlaced?: boolean;
+  videoOptimized?: boolean;
+}): CvtTimingResult {
+  const clockParams = (() => {
+    switch (reducedBlanking) {
+      case "cvt":
+        return { clockStep: 0.25, clockStepInv: 4, rbHBlank: 160, rbHSync: 32, rbMinVBlank: 460, rbVFrontPorch: 3, refreshMultiplier: 1 };
+      case "cvt_rb":
+        return { clockStep: 0.25, clockStepInv: 4, rbHBlank: 160, rbHSync: 32, rbMinVBlank: 460, rbVFrontPorch: 3, refreshMultiplier: 1 };
+      case "cvt_rb2":
+      default:
+        return { clockStep: 0.001, clockStepInv: 1000, rbHBlank: 80, rbHSync: 32, rbMinVBlank: 460, rbVFrontPorch: 1, refreshMultiplier: videoOptimized ? 1000 / 1001 : 1 };
+    }
+  })();
+
+  const cellGran = Math.floor(CVT_CELL_GRAN);
+  const fieldRateRequired = interlaced ? refreshHz * 2 : refreshHz;
+  const hPixelsRounded = Math.floor(hActive / cellGran) * cellGran;
+  const leftMargin = margins ? Math.floor((hPixelsRounded * CVT_MARGIN_PERCENT / 100) / cellGran) * cellGran : 0;
+  const totalActivePixels = hPixelsRounded + leftMargin * 2;
+
+  const vLinesRounded = interlaced ? Math.floor(vActive / 2) : Math.floor(vActive);
+  const topMargin = margins ? Math.floor(vLinesRounded * CVT_MARGIN_PERCENT / 100) : 0;
+  const bottomMargin = topMargin;
+  const interlaceFactor = interlaced ? 0.5 : 0;
+
+  const verPixels = interlaced ? 2 * vLinesRounded : vLinesRounded;
+  const aspectCandidates: Array<[string, number]> = [
+    ["4:3", 4 / 3],
+    ["16:9", 16 / 9],
+    ["16:10", 16 / 10],
+    ["5:4", 5 / 4],
+    ["15:9", 15 / 9],
+    ["43:18", 43 / 18],
+    ["64:27", 64 / 27],
+    ["12:5", 12 / 5],
+  ];
+  const aspectRatio = aspectCandidates.find(([_, ratio]) => (cellGran * Math.round(verPixels * ratio / cellGran)) === hPixelsRounded)?.[0] ?? "Unknown";
+
+  let vSyncRounded: number;
+  if (reducedBlanking === "cvt_rb2") vSyncRounded = 8;
+  else if (aspectRatio === "4:3") vSyncRounded = 4;
+  else if (aspectRatio === "16:9") vSyncRounded = 5;
+  else if (aspectRatio === "16:10") vSyncRounded = 6;
+  else if (aspectRatio === "5:4") vSyncRounded = 7;
+  else if (aspectRatio === "15:9") vSyncRounded = 7;
+  else vSyncRounded = 10;
+
+  let hBlank: number;
+  let hFrontPorch: number;
+  let hSync: number;
+  let hBackPorch: number;
+  let vFrontPorch: number;
+  let vBackPorch: number;
+  let vBlank: number;
+  let totalPixels: number;
+  let totalVLines: number;
+  let pixelClockMHz: number;
+
+  if (reducedBlanking === "cvt") {
+    const hPeriodEst = ((1 / fieldRateRequired) - CVT_MIN_VSYNC_BP / 1_000_000) / (vLinesRounded + (2 * topMargin) + CVT_MIN_V_PORCH + interlaceFactor) * 1_000_000;
+
+    let vSyncBackPorch = Math.floor(CVT_MIN_VSYNC_BP / hPeriodEst) + 1;
+    if (vSyncBackPorch < (vSyncRounded + CVT_MIN_V_BPORCH)) {
+      vSyncBackPorch = vSyncRounded + CVT_MIN_V_BPORCH;
+    }
+
+    vBlank = vSyncBackPorch + CVT_MIN_V_PORCH;
+    vFrontPorch = CVT_MIN_V_PORCH;
+    vBackPorch = vSyncBackPorch - vSyncRounded;
+
+    totalVLines = vLinesRounded + topMargin + bottomMargin + vSyncBackPorch + interlaceFactor + CVT_MIN_V_PORCH;
+
+    const idealDutyCycle = CVT_C_PRIME - (CVT_M_PRIME * hPeriodEst / 1000);
+    const minDutyCycle = 20;
+    if (idealDutyCycle < minDutyCycle) {
+      hBlank = Math.floor(totalActivePixels * minDutyCycle / (100 - minDutyCycle) / (2 * cellGran)) * (2 * cellGran);
+    } else {
+      hBlank = Math.floor(totalActivePixels * idealDutyCycle / (100 - idealDutyCycle) / (2 * cellGran)) * (2 * cellGran);
+    }
+
+    totalPixels = totalActivePixels + hBlank;
+
+    hSync = Math.floor(CVT_HSYNC_PERCENT * totalPixels / cellGran) * cellGran;
+    hBackPorch = hBlank / 2;
+    hFrontPorch = hBlank - hSync - hBackPorch;
+
+    pixelClockMHz = clockParams.clockStep * Math.floor(totalPixels / hPeriodEst / clockParams.clockStep);
+  } else {
+    const hPeriodEst = ((1_000_000 / fieldRateRequired) - clockParams.rbMinVBlank) / (vLinesRounded + topMargin + bottomMargin);
+    hBlank = clockParams.rbHBlank;
+
+    const vbiLines = Math.floor(clockParams.rbMinVBlank / hPeriodEst) + 1;
+    const rbMinVbi = clockParams.rbVFrontPorch + vSyncRounded + CVT_MIN_V_BPORCH;
+    const activeVbiLines = vbiLines < rbMinVbi ? rbMinVbi : vbiLines;
+
+    vBlank = activeVbiLines;
+    totalVLines = activeVbiLines + vLinesRounded + topMargin + bottomMargin + interlaceFactor;
+    totalPixels = totalActivePixels + clockParams.rbHBlank;
+
+    pixelClockMHz = Math.floor(fieldRateRequired * totalVLines * totalPixels * clockParams.clockStepInv / 1_000_000) * clockParams.refreshMultiplier / clockParams.clockStepInv;
+
+    if (reducedBlanking === "cvt_rb2") {
+      vFrontPorch = activeVbiLines - vSyncRounded - 6;
+      vBackPorch = 6;
+      hSync = clockParams.rbHSync;
+      hBackPorch = 40;
+      hFrontPorch = hBlank - hSync - hBackPorch;
+    } else {
+      vFrontPorch = 3;
+      vBackPorch = activeVbiLines - vFrontPorch - vSyncRounded;
+      hSync = clockParams.rbHSync;
+      hBackPorch = 80;
+      hFrontPorch = hBlank - hSync - hBackPorch;
+    }
+  }
+
+  return {
+    pixelClockMHz,
+    hTotal: Math.round(totalPixels),
+    vTotal: Math.round(totalVLines),
+    hBlank: Math.round(hBlank),
+    vBlank: Math.round(vBlank),
+    hFront: Math.round(hFrontPorch),
+    hSync: Math.round(hSync),
+    hBack: Math.round(hBackPorch),
+    vFront: Math.round(vFrontPorch),
+    vSync: Math.round(vSyncRounded),
+    vBack: Math.round(vBackPorch),
+  };
+}
+
 function codingEfficiency(coding: Coding) { return coding === "8b10b" ? 0.8 : 128/132; }
 function clamp(n:number, lo:number, hi:number){ return Math.max(lo, Math.min(hi,n)); }
 
@@ -66,25 +253,38 @@ interface TimingRow {
   hFront?: number; hSync?: number; hBack?: number;
   vFront?: number; vSync?: number; vBack?: number;
   bpp?: number; dscRatio?: number; // 3 or 2.4
+  bpc?: number; colorFormat?: ColorFormatId;
+  pixelClock?: number;
 }
 
+const DEFAULT_PRESET_TIMING = calculateCvtTiming({
+  hActive: 3840,
+  vActive: 2160,
+  refreshHz: 144,
+  reducedBlanking: "cvt_rb2",
+});
+
 const defaultCalc: Partial<TimingRow> = {
-  calcOpen: false, modeIndex: 0, cvtKind: "cvt_rb2",
-  h: 3840, v: 2160, hz: 144,
-  hFront: 8, hSync: 32, hBack: 120, // RB2 default 160 total
-  vFront: 3, vSync: 6, vBack: 9,
-  bpp: 24, dscRatio: 3,
+  calcOpen: false,
+  modeIndex: 0,
+  cvtKind: "cvt_rb2",
+  h: 3840,
+  v: 2160,
+  hz: 144,
+  hFront: DEFAULT_PRESET_TIMING.hFront,
+  hSync: DEFAULT_PRESET_TIMING.hSync,
+  hBack: DEFAULT_PRESET_TIMING.hBack,
+  vFront: DEFAULT_PRESET_TIMING.vFront,
+  vSync: DEFAULT_PRESET_TIMING.vSync,
+  vBack: DEFAULT_PRESET_TIMING.vBack,
+  bpc: DEFAULT_BPC,
+  colorFormat: DEFAULT_COLOR_FORMAT,
+  bpp: DEFAULT_BPC * COLOR_FORMATS[DEFAULT_COLOR_FORMAT].factor,
+  dscRatio: 3,
+  pixelClock: DEFAULT_PRESET_TIMING.pixelClockMHz,
 };
 
 const emptyTiming = (i: number): TimingRow => ({ id: `${Date.now()}_${i}`, label: `Timing ${i+1}`, peakBw:"", peakBwDsc:"", useDsc:true, ...defaultCalc });
-
-// ---------------- CVT calculators (template parameterizations) ----------------
-function cvtTotals(kind:CvtKind){
-  if(kind === "cvt_rb2") return { hFront:8, hSync:32, hBack:120, vFront:3, vSync:6, vBack:9 };
-  if(kind === "cvt_rb")  return { hFront:48, hSync:32, hBack:80,  vFront:3, vSync:6, vBack:33 };
-  if(kind === "cvt")     return { hFront:88, hSync:44, hBack:148, vFront:4, vSync:5, vBack:36 };
-  return null;
-}
 
 function pixelClockMHzFromTotals(
   h:number, v:number, hz:number,
@@ -146,43 +346,127 @@ export default function App(){
   // When a mode is chosen, set H/V/Hz and refresh blanking by current generator, then compute and fill peaks.
   function onChooseMode(t:TimingRow, modeIdx:number){
     const m = PREDEFINED_MODES[modeIdx];
-    const kind = (t.cvtKind||"cvt_rb2") as CvtKind;
-    const tmpl = cvtTotals(kind);
-    const hFront = tmpl? tmpl.hFront : (t.hFront??8);
-    const hSync  = tmpl? tmpl.hSync  : (t.hSync ??32);
-    const hBack  = tmpl? tmpl.hBack  : (t.hBack ??120);
-    const vFront = tmpl? tmpl.vFront : (t.vFront??3);
-    const vSync  = tmpl? tmpl.vSync  : (t.vSync ??6);
-    const vBack  = tmpl? tmpl.vBack  : (t.vBack ??9);
+    const kind = (t.cvtKind || "cvt_rb2") as CvtKind;
 
-    // compute peaks
-    const bpp = Number(t.bpp)||24;
-    const ratio = t.dscRatio && t.dscRatio>0 ? t.dscRatio : 3;
-    const clk = pixelClockMHzFromTotals(m.h, m.v, m.hz, hFront, hSync, hBack, vFront, vSync, vBack);
-    const peak = streamGbpsFromClock(clk, bpp);
-    const peakDsc = peak/ratio;
+    const bpc = Number(t.bpc) || DEFAULT_BPC;
+    const colorFormat = (t.colorFormat || DEFAULT_COLOR_FORMAT) as ColorFormatId;
+    const formatInfo = COLOR_FORMATS[colorFormat] ?? COLOR_FORMATS[DEFAULT_COLOR_FORMAT];
+    const ratio = t.dscRatio && t.dscRatio > 0 ? t.dscRatio : 3;
 
-    updateTiming(t.id, { modeIndex: modeIdx, h:m.h, v:m.v, hz:m.hz, hFront, hSync, hBack, vFront, vSync, vBack, peakBw: peak.toFixed(4), peakBwDsc: peakDsc.toFixed(4) });
+    let timingResult: CvtTimingResult | null = null;
+    if (kind !== "manual") {
+      timingResult = calculateCvtTiming({
+        hActive: m.h,
+        vActive: m.v,
+        refreshHz: m.hz,
+        reducedBlanking: kind as CvtProfile,
+      });
+    }
+
+    const hFront = timingResult ? timingResult.hFront : (t.hFront ?? 8);
+    const hSync = timingResult ? timingResult.hSync : (t.hSync ?? 32);
+    const hBack = timingResult ? timingResult.hBack : (t.hBack ?? 120);
+    const vFront = timingResult ? timingResult.vFront : (t.vFront ?? 3);
+    const vSync = timingResult ? timingResult.vSync : (t.vSync ?? 6);
+    const vBack = timingResult ? timingResult.vBack : (t.vBack ?? 9);
+    const pixelClock = timingResult
+      ? timingResult.pixelClockMHz
+      : pixelClockMHzFromTotals(m.h, m.v, m.hz, hFront, hSync, hBack, vFront, vSync, vBack);
+
+    const bpp = bpc * formatInfo.factor;
+    const peak = streamGbpsFromClock(pixelClock, bpp);
+    const peakDsc = peak / ratio;
+
+    updateTiming(t.id, {
+      modeIndex: modeIdx,
+      h: m.h,
+      v: m.v,
+      hz: m.hz,
+      hFront,
+      hSync,
+      hBack,
+      vFront,
+      vSync,
+      vBack,
+      bpc,
+      colorFormat,
+      bpp,
+      dscRatio: ratio,
+      pixelClock,
+      peakBw: peak.toFixed(4),
+      peakBwDsc: peakDsc.toFixed(4),
+    });
   }
 
   // Manual recompute based on current fields (inside submenu)
   function computeAndFill(id:string){
     setTimings(ts=> ts.map(t=>{
       if(t.id!==id) return t;
-      const h=Number(t.h)||1920, v=Number(t.v)||1080, hz=Number(t.hz)||60, bpp=Number(t.bpp)||24;
-      const ratio = t.dscRatio && t.dscRatio>0 ? t.dscRatio : 3;
-      const kind = (t.cvtKind||"cvt_rb2") as CvtKind; // if manual, keep current totals as is
-      const tmpl = kind==="manual"? null : cvtTotals(kind);
-      const hFront = tmpl? tmpl.hFront : Number(t.hFront)||8;
-      const hSync  = tmpl? tmpl.hSync  : Number(t.hSync)||32;
-      const hBack  = tmpl? tmpl.hBack  : Number(t.hBack)||120;
-      const vFront = tmpl? tmpl.vFront : Number(t.vFront)||3;
-      const vSync  = tmpl? tmpl.vSync  : Number(t.vSync)||6;
-      const vBack  = tmpl? tmpl.vBack  : Number(t.vBack)||9;
-      const clk = pixelClockMHzFromTotals(h,v,hz,hFront,hSync,hBack,vFront,vSync,vBack);
-      const peak = streamGbpsFromClock(clk, bpp);
-      const peakDsc = peak/ratio;
-      return { ...t, h,v,hz,hFront,hSync,hBack,vFront,vSync,vBack,bpp,dscRatio:ratio, peakBw:peak.toFixed(4), peakBwDsc:peakDsc.toFixed(4) };
+      const h = Number(t.h) || 1920;
+      const v = Number(t.v) || 1080;
+      const hz = Number(t.hz) || 60;
+      const kind = (t.cvtKind || "cvt_rb2") as CvtKind;
+
+      const bpc = Number(t.bpc) || DEFAULT_BPC;
+      const colorFormat = (t.colorFormat || DEFAULT_COLOR_FORMAT) as ColorFormatId;
+      const formatInfo = COLOR_FORMATS[colorFormat] ?? COLOR_FORMATS[DEFAULT_COLOR_FORMAT];
+      const ratio = t.dscRatio && t.dscRatio > 0 ? t.dscRatio : 3;
+
+      let hFront: number;
+      let hSync: number;
+      let hBack: number;
+      let vFront: number;
+      let vSync: number;
+      let vBack: number;
+      let pixelClock: number;
+
+      if (kind === "manual") {
+        hFront = Number(t.hFront) || 8;
+        hSync = Number(t.hSync) || 32;
+        hBack = Number(t.hBack) || 120;
+        vFront = Number(t.vFront) || 3;
+        vSync = Number(t.vSync) || 6;
+        vBack = Number(t.vBack) || 9;
+        pixelClock = pixelClockMHzFromTotals(h, v, hz, hFront, hSync, hBack, vFront, vSync, vBack);
+      } else {
+        const result = calculateCvtTiming({
+          hActive: h,
+          vActive: v,
+          refreshHz: hz,
+          reducedBlanking: kind as CvtProfile,
+        });
+        hFront = result.hFront;
+        hSync = result.hSync;
+        hBack = result.hBack;
+        vFront = result.vFront;
+        vSync = result.vSync;
+        vBack = result.vBack;
+        pixelClock = result.pixelClockMHz;
+      }
+
+      const bpp = bpc * formatInfo.factor;
+      const peak = streamGbpsFromClock(pixelClock, bpp);
+      const peakDsc = peak / ratio;
+
+      return {
+        ...t,
+        h,
+        v,
+        hz,
+        hFront,
+        hSync,
+        hBack,
+        vFront,
+        vSync,
+        vBack,
+        bpc,
+        colorFormat,
+        bpp,
+        dscRatio: ratio,
+        pixelClock,
+        peakBw: peak.toFixed(4),
+        peakBwDsc: peakDsc.toFixed(4),
+      };
     }));
   }
 
@@ -195,10 +479,75 @@ export default function App(){
   const onImport = (e:React.ChangeEvent<HTMLInputElement>)=>{
     const file = e.target.files?.[0]; if(!file) return; const r=new FileReader();
     r.onload = ()=>{ try{ const j=JSON.parse(String(r.result||"{}")); if(Array.isArray(j.timings)){
-      const restored:TimingRow[] = j.timings.map((t:any,i:number)=>({ id:t.id||`${Date.now()}_${i}`, label:String(t.label??`Timing ${i+1}`), peakBw:String(t.peakBw??""), peakBwDsc:String(t.peakBwDsc??""), useDsc:Boolean(t.useDsc), calcOpen:Boolean(t.calcOpen), modeIndex: typeof t.modeIndex==='number'? t.modeIndex:0, cvtKind: t.cvtKind||"cvt_rb2", h:t.h, v:t.v, hz:t.hz, hFront:t.hFront, hSync:t.hSync, hBack:t.hBack, vFront:t.vFront, vSync:t.vSync, vBack:t.vBack, bpp:t.bpp, dscRatio:t.dscRatio })).slice(0,4);
+      const restored:TimingRow[] = j.timings.map((t:any,i:number)=>{
+        const importedFormat = typeof t.colorFormat === "string" && t.colorFormat in COLOR_FORMATS ? (t.colorFormat as ColorFormatId) : DEFAULT_COLOR_FORMAT;
+        const rawBpc = Number(t.bpc);
+        const bpc = Number.isFinite(rawBpc) && rawBpc > 0 ? rawBpc : DEFAULT_BPC;
+        const formatInfo = COLOR_FORMATS[importedFormat] ?? COLOR_FORMATS[DEFAULT_COLOR_FORMAT];
+        const rawBpp = Number(t.bpp);
+        const bpp = Number.isFinite(rawBpp) && rawBpp > 0 ? rawBpp : bpc * formatInfo.factor;
+
+        const h = Number(t.h);
+        const v = Number(t.v);
+        const hz = Number(t.hz);
+        const hFront = Number(t.hFront);
+        const hSync = Number(t.hSync);
+        const hBack = Number(t.hBack);
+        const vFront = Number(t.vFront);
+        const vSync = Number(t.vSync);
+        const vBack = Number(t.vBack);
+
+        const hasTotals = [h, v, hz, hFront, hSync, hBack, vFront, vSync, vBack].every((value) => Number.isFinite(value));
+        const rawPixelClock = Number(t.pixelClock);
+        const computedPixelClock = hasTotals
+          ? pixelClockMHzFromTotals(
+              h as number,
+              v as number,
+              hz as number,
+              hFront as number,
+              hSync as number,
+              hBack as number,
+              vFront as number,
+              vSync as number,
+              vBack as number
+            )
+          : undefined;
+        const pixelClock = Number.isFinite(rawPixelClock) && rawPixelClock > 0 ? rawPixelClock : computedPixelClock;
+
+        return {
+          id: t.id || `${Date.now()}_${i}`,
+          label: String(t.label ?? `Timing ${i + 1}`),
+          peakBw: String(t.peakBw ?? ""),
+          peakBwDsc: String(t.peakBwDsc ?? ""),
+          useDsc: Boolean(t.useDsc),
+          calcOpen: Boolean(t.calcOpen),
+          modeIndex: typeof t.modeIndex === 'number' ? t.modeIndex : 0,
+          cvtKind: t.cvtKind || "cvt_rb2",
+          h: Number.isFinite(h) ? (h as number) : undefined,
+          v: Number.isFinite(v) ? (v as number) : undefined,
+          hz: Number.isFinite(hz) ? (hz as number) : undefined,
+          hFront: Number.isFinite(hFront) ? (hFront as number) : undefined,
+          hSync: Number.isFinite(hSync) ? (hSync as number) : undefined,
+          hBack: Number.isFinite(hBack) ? (hBack as number) : undefined,
+          vFront: Number.isFinite(vFront) ? (vFront as number) : undefined,
+          vSync: Number.isFinite(vSync) ? (vSync as number) : undefined,
+          vBack: Number.isFinite(vBack) ? (vBack as number) : undefined,
+          bpp,
+          bpc,
+          colorFormat: importedFormat,
+          dscRatio: t.dscRatio,
+          pixelClock,
+        };
+      }).slice(0,4);
       setTimings(restored.length? restored : [emptyTiming(0)]);
     }
-    if(j.transport){ setRate(Number(j.transport.rate)||rate); setLanes(clamp(Number(j.transport.lanes)||lanes,1,4)); setCoding(j.transport.coding==="8b10b"?"8b10b":"128b/132b" as any); }
+    if(j.transport){
+      setRate(Number(j.transport.rate)||rate);
+      const importedLanes = Number(j.transport.lanes);
+      const laneOption = LANE_OPTIONS.includes(importedLanes as (typeof LANE_OPTIONS)[number]) ? importedLanes : LANE_OPTIONS[LANE_OPTIONS.length-1];
+      setLanes(laneOption);
+      setCoding(j.transport.coding==="8b10b"?"8b10b":"128b/132b" as any);
+    }
     if(typeof j.presetId==="string") setPresetId(j.presetId); } catch(err){ alert("Invalid JSON file."); } };
     r.readAsText(file); e.target.value="";
   };
@@ -221,7 +570,19 @@ export default function App(){
               </Select>
             </div>
             <div className="grid grid-cols-3 gap-3 items-end">
-              <div><label className="text-sm font-medium">Lanes</label><Input type="number" min={1} max={4} className="mt-1" value={lanes} onChange={e=>setLanes(clamp(Number(e.target.value)||0,1,4))}/></div>
+              <div>
+                <label className="text-sm font-medium">Lanes</label>
+                <Select value={String(lanes)} onValueChange={(value)=>setLanes(Number(value))}>
+                  <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
+                  <SelectContent>
+                    {LANE_OPTIONS.map(option => (
+                      <SelectItem key={option} value={String(option)}>
+                        {option} Lane{option > 1 ? "s" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
               <div><label className="text-sm font-medium">Per‑lane rate (Gbps)</label><Input type="number" step="0.01" className="mt-1" value={rate} onChange={e=>setRate(Number(e.target.value)||0)}/></div>
               <div>
                 <label className="text-sm font-medium">Coding</label>
@@ -243,8 +604,36 @@ export default function App(){
 
         {/* Timings (stacked) */}
         <div className="mt-6 grid grid-cols-1 gap-4">
-          {timings.map((t)=> (
-            <motion.div key={t.id} initial={{opacity:0,y:6}} animate={{opacity:1,y:0}}>
+          {timings.map((t)=> {
+            const activeH = Number(t.h) || 0;
+            const activeV = Number(t.v) || 0;
+            const refreshValue = Number(t.hz) || 0;
+            const frontPorchH = Number(t.hFront) || 0;
+            const syncWidthH = Number(t.hSync) || 0;
+            const backPorchH = Number(t.hBack) || 0;
+            const frontPorchV = Number(t.vFront) || 0;
+            const syncWidthV = Number(t.vSync) || 0;
+            const backPorchV = Number(t.vBack) || 0;
+            const pixelClockRaw = typeof t.pixelClock === "number" ? t.pixelClock : undefined;
+            const derivedPixelClock = pixelClockRaw ?? (activeH > 0 && activeV > 0 && refreshValue > 0
+              ? pixelClockMHzFromTotals(
+                  activeH,
+                  activeV,
+                  refreshValue,
+                  frontPorchH,
+                  syncWidthH,
+                  backPorchH,
+                  frontPorchV,
+                  syncWidthV,
+                  backPorchV
+                )
+              : undefined);
+            const normalizedPixelClock = typeof derivedPixelClock === "number" && Number.isFinite(derivedPixelClock) && derivedPixelClock > 0
+              ? derivedPixelClock
+              : undefined;
+            const pixelClockText = normalizedPixelClock ? `${normalizedPixelClock.toFixed(3)} MHz` : "—";
+            return (
+              <motion.div key={t.id} initial={{opacity:0,y:6}} animate={{opacity:1,y:0}}>
               <Card className="rounded-2xl shadow-sm"><CardContent className="p-5 grid gap-3">
                 <div className="flex items-center justify-between">
                   <div className="text-sm font-medium">{t.label}</div>
@@ -264,7 +653,8 @@ export default function App(){
                       <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
                       <SelectContent>{PREDEFINED_MODES.map((m,i)=>(<SelectItem key={i} value={String(i)}>{m.label}</SelectItem>))}</SelectContent>
                     </Select>
-                    <div className="mt-2 grid grid-cols-3 gap-2 text-xs text-slate-600">
+                    <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs text-slate-600">
+                      <div><div className="font-medium">Pixel clock</div><div>{pixelClockText}</div></div>
                       <div><div className="font-medium">H blank</div><div>{(t.hFront??0)+(t.hSync??0)+(t.hBack??0)} px</div></div>
                       <div><div className="font-medium">V blank</div><div>{(t.vFront??0)+(t.vSync??0)+(t.vBack??0)} lines</div></div>
                       <div><div className="font-medium">Gen</div><div>{t.cvtKind||'cvt_rb2'}</div></div>
@@ -307,13 +697,37 @@ export default function App(){
                         <div><label className="font-medium">V</label><Input className="mt-1" type="number" value={t.v??2160} onChange={e=>updateTiming(t.id,{v:Number(e.target.value)||0})}/></div>
                         <div><label className="font-medium">Hz</label><Input className="mt-1" type="number" step="0.01" value={t.hz??144} onChange={e=>updateTiming(t.id,{hz:Number(e.target.value)||0})}/></div>
                       </div>
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid md:grid-cols-3 gap-2">
                         <div>
-                          <label>BPP (uncompressed)</label>
-                          <Input className="mt-1" type="number" value={t.bpp??24} onChange={e=>updateTiming(t.id,{bpp:Number(e.target.value)||0})}/>
+                          <label className="font-medium">Bits per component (bpc)</label>
+                          <Select value={String(t.bpc ?? DEFAULT_BPC)} onValueChange={(value)=>{
+                            const nextBpc = Number(value) || DEFAULT_BPC;
+                            const formatKey = (t.colorFormat || DEFAULT_COLOR_FORMAT) as ColorFormatId;
+                            const formatInfo = COLOR_FORMATS[formatKey] ?? COLOR_FORMATS[DEFAULT_COLOR_FORMAT];
+                            updateTiming(t.id,{ bpc: nextBpc, bpp: nextBpc * formatInfo.factor });
+                          }}>
+                            <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
+                            <SelectContent>
+                              {[5,6,8,10,12,16].map(option=> (<SelectItem key={option} value={String(option)}>{option}-bit</SelectItem>))}
+                            </SelectContent>
+                          </Select>
                         </div>
                         <div>
-                          <label>DSC ratio</label>
+                          <label className="font-medium">Color format</label>
+                          <Select value={(t.colorFormat || DEFAULT_COLOR_FORMAT) as string} onValueChange={(value)=>{
+                            const formatKey = (value as ColorFormatId);
+                            const bpc = Number(t.bpc) || DEFAULT_BPC;
+                            const formatInfo = COLOR_FORMATS[formatKey] ?? COLOR_FORMATS[DEFAULT_COLOR_FORMAT];
+                            updateTiming(t.id,{ colorFormat: formatKey, bpp: bpc * formatInfo.factor });
+                          }}>
+                            <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
+                            <SelectContent>
+                              {Object.entries(COLOR_FORMATS).map(([key, info]) => (<SelectItem key={key} value={key}>{info.label}</SelectItem>))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                        <div>
+                          <label className="font-medium">DSC ratio</label>
                           <Select value={String(t.dscRatio??3)} onValueChange={(v)=> updateTiming(t.id,{ dscRatio: Number(v) })}>
                             <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
                             <SelectContent>
@@ -346,7 +760,8 @@ export default function App(){
                 <div className="text-xs text-slate-600">Using: <span className="font-medium">{t.useDsc ? (Number(t.peakBwDsc)||0).toFixed(2) : (Number(t.peakBw)||0).toFixed(2)} Gbps</span></div>
               </CardContent></Card>
             </motion.div>
-          ))}
+          );
+        })}
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
