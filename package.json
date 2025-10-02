@@ -48,5 +48,6 @@
     "directories": {
       "output": "release"
     }
-  }
+  },
+  "main": "dist-electron/main/main.js"
 }
