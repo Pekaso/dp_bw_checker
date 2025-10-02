@@ -880,8 +880,11 @@ export default function App(){
                   <span>MST time slots</span>
                   <span>{slotsUsed}/{MST_SLOT_TOTAL}{overflowSlots > 0 ? ` (+${overflowSlots} overflow)` : ''}</span>
                 </div>
-                <div className="overflow-x-auto">
-                  <div className="flex min-w-[512px] gap-1 py-1">
+                <div className="mt-2">
+                  <div
+                    className="grid gap-[2px]"
+                    style={{ gridTemplateColumns: `repeat(${MST_SLOT_TOTAL}, minmax(0, 1fr))` }}
+                  >
                     {mstSlots.map((slotOwner, index) => {
                       const color = slotOwner !== null ? TIMING_COLORS[slotOwner % TIMING_COLORS.length] : '#cbd5f5';
                       const tooltip = slotOwner !== null
@@ -890,7 +893,7 @@ export default function App(){
                       return (
                         <div
                           key={index}
-                          className="h-3 w-3 rounded-sm border border-slate-200"
+                          className="h-3 rounded-sm border border-slate-200"
                           style={{ backgroundColor: color, opacity: slotOwner !== null ? 1 : 0.35 }}
                           title={tooltip}
                         />
