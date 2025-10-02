@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "NodeNext",
+    "target": "ESNext",
+    "outDir": "dist-electron",
+    "types": ["node", "electron"],
+    "allowJs": false
+  },
+  "include": ["electron/**/*.ts"],
+  "exclude": ["node_modules"]
+}
