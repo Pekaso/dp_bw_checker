@@ -909,7 +909,7 @@ export default function App(){
             </div>
           </CardContent>
         </Card>
-        <div className="mt-8 text-center text-xs text-slate-500">Built for quick feasibility checks.</div>
+        <div className="mt-8 text-center text-xs text-slate-500">The DisplayPort bandwidth calculation is for reference only.</div>
       </div>
     </div>
   );
