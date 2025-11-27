@@ -53,7 +53,8 @@ const PREDEFINED_MODES: PredefinedMode[] = [
   { label: "3840×2160 @ 120", h: 3840, v: 2160, hz: 120 },
   { label: "3840×2160 @ 144", h: 3840, v: 2160, hz: 144 },
   { label: "3840×2160 @ 240", h: 3840, v: 2160, hz: 240 },
-  { label: "5120×1440 @ 120", h: 5120, v: 1440, hz: 120 },
+  { label: "5120×2160 @ 60",  h: 5120, v: 2160, hz:  60 },
+  { label: "5120×2160 @ 120", h: 5120, v: 2160, hz: 120 },
 ];
 
 const COLOR_FORMATS = {
@@ -803,8 +804,9 @@ export default function App(){
                           <Select value={String(t.dscRatio??3)} onValueChange={(v)=> updateTiming(t.id,{ dscRatio: Number(v) })}>
                             <SelectTrigger className="mt-1"><SelectValue/></SelectTrigger>
                             <SelectContent>
-                              <SelectItem value={String(3)}>3:1</SelectItem>
+                              <SelectItem value={String(3.0)}>3.0:1</SelectItem>
                               <SelectItem value={String(2.4)}>2.4:1</SelectItem>
+                              <SelectItem value={String(2.0)}>2.0:1</SelectItem>
                             </SelectContent>
                           </Select>
                         </div>
